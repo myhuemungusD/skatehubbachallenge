@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isGamePlayer(game) {
+      return (
+        request.auth != null &&
+        (game.data.players.A.uid == request.auth.uid || game.data.players.B.uid == request.auth.uid)
+      );
+    }
+
+    match /users/{userId} {
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    match /games/{gameId} {
+      allow read: if isGamePlayer(resource);
+      allow write: if false;
+    }
+
+    match /rateLimits/{userId} {
+      allow read, write: if false;
+    }
+  }
+}

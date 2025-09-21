@@ -1,0 +1,32 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isVideo() {
+      return request.resource != null &&
+        (request.resource.contentType == 'video/mp4' ||
+         request.resource.contentType == 'video/quicktime' ||
+         request.resource.contentType == 'video/webm');
+    }
+
+    function isShooter(game) {
+      let slot = (game.data.players.A.uid == request.auth.uid) ? 'A' :
+                 (game.data.players.B.uid == request.auth.uid ? 'B' : null);
+      if (slot == null) {
+        return false;
+      }
+      return (game.data.phase == 'SET_RECORD' && slot == game.data.turn) ||
+             (game.data.phase == 'RESP_RECORD' && slot != game.data.turn);
+    }
+
+    match /videos/{gameId}/{fileId} {
+      allow read: if true;
+      allow write: if request.auth != null && isVideo() && request.resource.size < 120 * 1024 * 1024 &&
+        isShooter(get(/databases/(default)/documents/games/$(gameId)));
+    }
+
+    match /{allPaths=**} {
+      allow read: if false;
+      allow write: if false;
+    }
+  }
+}

@@ -1,0 +1,11 @@
+node_modules
+.next
+out
+.env.local
+.env
+firebase-debug.log
+functions/node_modules
+coverage
+playwright-report
+.lhci
+.DS_Store
