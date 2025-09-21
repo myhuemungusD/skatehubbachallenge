@@ -1,0 +1,88 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function objectPath() {
+      return request.resource != null
+        ? request.resource.name.substring(request.resource.name.indexOf('/objects/') + 9)
+        : resource.name.substring(resource.name.indexOf('/objects/') + 9);
+    }
+
+    function isHistoryObject() {
+      let path = objectPath();
+      return path.indexOf('games/') == 0 && path.indexOf('/history/') != -1;
+    }
+
+    function gameId() {
+      let path = objectPath();
+      if (!path.startsWith('games/')) {
+        return '';
+      }
+      let remainder = path.substring(6);
+      let slashIndex = remainder.indexOf('/');
+      return slashIndex == -1 ? remainder : remainder.substring(0, slashIndex);
+    }
+
+    function gameDoc() {
+      return firestore.get(/databases/(default)/documents/games/$(gameId()));
+    }
+
+    function gameExists() {
+      return gameDoc().data != null;
+    }
+
+    function authUid() {
+      return request.auth != null ? request.auth.uid : null;
+    }
+
+    function slotFor(game) {
+      return game.data.players.A.uid == authUid()
+        ? 'A'
+        : game.data.players.B.uid == authUid()
+        ? 'B'
+        : '';
+    }
+
+    function isShooter(game) {
+      return slotFor(game) == game.data.current.by;
+    }
+
+    function isResponder(game) {
+      let current = game.data.current;
+      let responder = current.responder != null ? current.responder : (current.by == 'A' ? 'B' : 'A');
+      return slotFor(game) == responder;
+    }
+
+    function isUploadAllowed(game) {
+      return (game.data.phase == 'SET_RECORD' && isShooter(game)) ||
+        (game.data.phase == 'RESP_RECORD' && isResponder(game));
+    }
+
+    function isValidContentType() {
+      return request.resource != null &&
+        (request.resource.contentType == 'video/mp4' ||
+          request.resource.contentType == 'video/quicktime' ||
+          request.resource.contentType == 'video/webm');
+    }
+
+    function isValidSize() {
+      return request.resource != null && request.resource.size < 125829120; // 120MB
+    }
+
+    match /games/{gameId}/{allPaths=**} {
+      allow read: if isHistoryObject() || (gameExists() && slotFor(gameDoc()) != '');
+
+      allow create: if gameExists() &&
+        authUid() != null &&
+        isUploadAllowed(gameDoc()) &&
+        isValidContentType() &&
+        isValidSize();
+
+      allow update: if false;
+    }
+
+    match /{path=**} {
+      allow read: if false;
+      allow write: if false;
+    }
+  }
+}
