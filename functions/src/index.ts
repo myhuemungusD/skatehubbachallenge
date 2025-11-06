@@ -91,7 +91,7 @@ const getPlayerSlot = (game: GameDoc, uid: string): PlayerSlot | null => {
 
 const opponentSlot = (slot: PlayerSlot): PlayerSlot => (slot === "A" ? "B" : "A");
 
-const appendHistory = (tx: Transaction, ref: DocumentReference<GameDoc>, entry: GameHistoryEntry) => {
+const appendHistory = (tx: Transaction, ref: DocumentReference<GameDoc>, entry: Omit<GameHistoryEntry, 'ts'>) => {
   tx.update(ref, {
     history: admin.firestore.FieldValue.arrayUnion({
       ...entry,
@@ -344,13 +344,13 @@ export const judgeResp = functions
       }
       const defenderSlot = opponentSlot(slot);
       const defender = game.players[defenderSlot];
-      const historyEntry: GameHistoryEntry = {
+      const historyEntryBase = {
         by: slot,
         setPath: game.current?.setVideoPath ?? null,
         respPath: game.current?.responseVideoPath ?? null
       };
       if (approve) {
-        appendHistory(tx, ref, { ...historyEntry, result: "landed" });
+        appendHistory(tx, ref, { ...historyEntryBase, result: "landed" });
         tx.update(ref, {
           phase: "SET_RECORD",
           turn: defenderSlot,
@@ -374,7 +374,7 @@ export const judgeResp = functions
         if (nextLetters >= 3) {
           (updates as UpdateData<GameDoc> & { winner?: string }).winner = game.players[slot].uid;
         }
-        appendHistory(tx, ref, { ...historyEntry, result: "failed" });
+        appendHistory(tx, ref, { ...historyEntryBase, result: "failed" });
         tx.update(ref, updates);
       }
     });
