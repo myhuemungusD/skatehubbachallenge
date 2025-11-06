@@ -1,101 +1,112 @@
-# SkateHubba Functions & Security Rules
+# SkateHubba Live S.K.8
 
-This repository contains the Firebase backend surface for SkateHubba, including typed Cloud Functions, Firestore security rules, and Storage security rules tailored for the two-player S.K.8 flow.
+Apple-grade polished MVP for running real-time S.K.8 battles with Firebase authority, Tailwind UI, and Next.js 14 App Router.
 
-## Prerequisites
+## Features
 
-- Node.js 18+
-- Firebase CLI (`npm install -g firebase-tools`)
-- A Firebase project with Firestore, Functions, and Storage enabled
+- 🔐 Firebase Auth (anonymous + Google upgrade) with handle reservation via Cloud Function.
+- 🎮 Two-player S.K.8 lobby with Firestore realtime listeners and deterministic Cloud Function refs.
+- 🎥 MediaRecorder capture with resumable Storage uploads guarded by rules.
+- 🏁 Server-authoritative scoring, SK8 letters, and match flow (SET/RESP phases + self-fail integrity).
+- 📡 PWA installable shell, offline fallback, Sentry telemetry, analytics consent, WCAG-focused UI.
+- ✅ CI-ready: ESLint, TypeScript strict, Vitest unit tests, Playwright smoke test scaffold, Lighthouse CI.
 
 ## Getting Started
 
-1. **Install dependencies**
+### 1. Clone & Install
+
+```bash
+pnpm install
+pnpm exec playwright install --with-deps
+```
+
+### 2. Firebase Project Setup
+
+1. Create a Firebase project.
+2. Enable Authentication providers: **Anonymous** and **Google**.
+3. Create Firestore database (production mode) and Storage bucket.
+4. Enable Cloud Functions, set region `us-central1`.
+5. Create the `videos` storage bucket (default bucket works) and deploy the provided `storage.rules`.
+6. In Firestore, run the rules from `firestore.rules`.
+7. Deploy Functions:
 
    ```bash
    cd functions
    npm install
+   npm run build
+   firebase deploy --only functions --project <your-project-id>
    ```
 
-2. **Configure environment variables**
+8. Set the following environment variables in `.env.local` (copy from `.env.example`).
 
-   Copy the example environment file and populate values:
+### 3. Local Development
 
-   ```bash
-   cp .env.example .env
-   ```
+```bash
+pnpm dev
+```
 
-   Recommended variables:
+When using Firebase emulators, set `NEXT_PUBLIC_USE_FIREBASE_EMULATORS=true` and start emulators:
 
-   - `SENTRY_DSN`: Sentry DSN for error reporting
-   - `SENTRY_ENVIRONMENT`: Deployment environment name (e.g., `production`)
-   - `RATE_LIMIT_REQUESTS`: Requests allowed per window for callable functions
-   - `RATE_LIMIT_WINDOW_MS`: Rate limit window duration in milliseconds
+```bash
+firebase emulators:start --import=./.emulator-data
+```
 
-3. **Emulate locally**
+### 4. Testing & QA
 
-   ```bash
-   firebase emulators:start
-   ```
+- **Lint & Typecheck**
+  ```bash
+  pnpm lint
+  pnpm typecheck
+  ```
+- **Unit tests (Vitest)**
+  ```bash
+  pnpm test
+  ```
+- **E2E (Playwright)**
+  ```bash
+  pnpm test:e2e
+  ```
+- **Lighthouse CI**
+  ```bash
+  pnpm exec lhci autorun
+  ```
 
-4. **Deploy**
+### 5. Deployment
 
-   ```bash
-   npm run deploy --prefix functions
-   ```
+1. Build Next.js app: `pnpm build`.
+2. Deploy hosting via Vercel/Netlify (Next.js 14).
+3. Deploy Firebase rules and functions as above.
+4. Configure Sentry DSN in environment.
 
-## Cloud Functions
+## Architecture Notes
 
-| Function | Description |
-| --- | --- |
-| `createGame` | Creates a new S.K.8 match, generating a unique six-character join code. |
-| `joinGame` | Allows the second skater to join a game using the shared code. |
-| `submitSetClip` | Records the setter's clip and transitions the game to the opponent review phase. |
-| `judgeSet` | Lets the non-shooter approve or decline the set clip. |
-| `submitRespClip` | Stores the responder's attempt and moves the game to setter review. |
-| `judgeResp` | Authoritatively applies letters, determines winners, and rotates turns. |
-| `selfFailSet` | Allows the shooter to end their turn without a valid set. |
-| `selfFailResp` | Lets the responder concede the attempt, applying the appropriate letter. |
+- `app/` contains App Router pages: `/` for lobby management, `/game/[code]` for live battles.
+- `components/` holds UI primitives (shadcn-inspired), feature widgets (ScoreBoard, GameControls, VideoRecorder), and platform helpers.
+- `lib/` includes Firebase clients, hooks, and type definitions.
+- `store/` uses Zustand for global UI states (toasts, action indicators).
+- `functions/` implements HTTPS callable Cloud Functions enforcing match flow and scoring.
+- Security posture: Firestore and Storage rules lock reads/writes to authenticated players; Cloud Functions ensure letters and phase transitions.
 
-Each callable function enforces:
+## Testing Checklist
 
-- Authentication (players only)
-- Game membership validation
-- Phase-aware state transitions
-- Single-attempt guarantees for set and response clips
-- Rate limiting based on UID and IP address
+- [ ] Sign in anonymously, set handle, create lobby.
+- [ ] Join lobby from second session, verify realtime sync.
+- [ ] Record set clip (auto upload) → opponent approves.
+- [ ] Defender records response → setter judges make/fail → letters update.
+- [ ] Self-fail flows work for both setter and responder.
+- [ ] Winner state locks deck when SK8 reached.
 
-Errors are captured with Sentry via its HTTPS ingestion API and emitted with structured logs for observability.
+## Accessibility & Performance
 
-## Firestore Security Rules
+- High-contrast palette, focus outlines, keyboard-accessible controls, ARIA statuses on toast.
+- Videos lazy-load with `preload="metadata"` for quick scrubbing.
+- PWA manifest + service worker for install/offline shell.
+- Lighthouse CI configured in GitHub Actions for ≥90 performance targets.
 
-The Firestore ruleset (`firestore.rules`) ensures that:
+## Environment Variables
 
-- Only authenticated participants can read or mutate their game document.
-- Every write matches a valid phase transition (set submission, approvals, judging, or self-fails).
-- Shooters/responder identities are enforced on each transition.
-- Letters are awarded exactly once and winners are immutable after declaration.
+See `.env.example`. Ensure the Firebase web config matches your project.
 
-## Storage Security Rules
+## License
 
-The Storage rules (`storage.rules`) provide:
-
-- Upload access exclusively to the active shooter or responder based on the current game phase.
-- File-type validation for `video/mp4`, `video/quicktime`, and `video/webm` uploads.
-- Maximum clip size of 120 MB.
-- Public read access for archived history clips while keeping active attempts private to players.
-
-## Source Maps & CI
-
-TypeScript compilation outputs source maps (`tsconfig.json` sets `"sourceMap": true`) to power error reporting in Sentry. The `npm run build` script compiles the TypeScript sources and should be used in CI pipelines ahead of deployment.
-
-## Deployment Pipeline
-
-Integrate the following high-level steps in CI/CD:
-
-1. Install dependencies (`npm ci` inside `functions/`).
-2. Run linting (`npm run lint`).
-3. Compile TypeScript (`npm run build`).
-4. Deploy via Firebase CLI (`firebase deploy --only functions,firestore:rules,storage:rules`).
-
-Adjust secrets in your CI environment to expose Sentry DSN and Firebase tokens securely.
+MIT

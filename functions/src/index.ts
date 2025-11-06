@@ -1,559 +1,460 @@
-import * as admin from 'firebase-admin';
-import { setGlobalOptions, logger } from 'firebase-functions/v2';
-import {
-  CallableRequest,
-  HttpsError,
-  onCall,
-} from 'firebase-functions/v2/https';
-import { captureException, flush } from './sentry';
-import { z } from 'zod';
-import {
-  GameState,
-  HistoryEntry,
-  HistoryResult,
-  PlayerSlot,
-  RateLimitDoc,
-} from './types';
+import * as functions from "firebase-functions";
+import * as admin from "firebase-admin";
+import * as Sentry from "@sentry/node";
+import type { firestore as FirestoreNS } from "firebase-admin";
 
-setGlobalOptions({
-  region: 'us-central1',
-  timeoutSeconds: 60,
-  memory: '512MiB',
-  maxInstances: 50,
-});
+type PlayerSlot = "A" | "B";
+type Phase = "SET_RECORD" | "SET_JUDGE" | "RESP_RECORD" | "RESP_JUDGE";
 
-if (admin.apps.length === 0) {
+type Transaction = FirestoreNS.Transaction;
+type DocumentReference<T> = FirestoreNS.DocumentReference<T>;
+type UpdateData<T> = FirestoreNS.UpdateData<T>;
+
+type GameHistoryEntry = {
+  by: PlayerSlot;
+  setPath?: string | null;
+  respPath?: string | null;
+  result: "declined_set" | "approved_set" | "landed" | "failed";
+  ts: FirebaseFirestore.Timestamp | number;
+};
+
+type GameDoc = {
+  code: string;
+  turn: PlayerSlot;
+  phase: Phase;
+  winner?: string | null;
+  players: Record<PlayerSlot, { uid: string; name: string; letters: number }>;
+  current: {
+    by: PlayerSlot;
+    setVideoPath?: string | null;
+    responseVideoPath?: string | null;
+  };
+  history: GameHistoryEntry[];
+};
+
+if (!admin.apps.length) {
   admin.initializeApp();
 }
 
+Sentry.init({ dsn: process.env.SENTRY_DSN || "" });
+
 const db = admin.firestore();
-const LETTER_SEQUENCE = ['S', 'K', '8'];
-const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
-const RATE_LIMIT_REQUESTS = Number(process.env.RATE_LIMIT_REQUESTS ?? 30);
 
-const nameSchema = z
-  .string()
-  .trim()
-  .min(2, 'Display name must be at least 2 characters.')
-  .max(50, 'Display name must be 50 characters or less.');
+type CallableContext = functions.https.CallableContext;
 
-const codeSchema = z
-  .string()
-  .trim()
-  .length(6, 'Game code must be exactly 6 characters.')
-  .regex(/^[A-Z0-9]{6}$/);
-
-const gameIdSchema = z.string().trim().min(1);
-
-const storagePathSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .regex(/^games\/[A-Za-z0-9/_-]+\.(mp4|mov|webm)$/i, 'Invalid storage path.');
-
-type GameTransaction<T> = (gameRef: FirebaseFirestore.DocumentReference<GameState>, data: GameState) => T;
-
-type EnforceRateLimitArgs = {
-  request: CallableRequest<unknown>;
-  functionName: string;
+const ensureAuth = (context: CallableContext) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "Sign in to continue");
+  }
+  return context.auth.uid;
 };
 
-type CallableHandler<T = unknown> = (request: CallableRequest<unknown>) => Promise<T> | T;
-
-function withSentry<T>(handler: CallableHandler<T>): CallableHandler<T> {
-  return async (request) => {
-    try {
-      return await handler(request);
-    } catch (error) {
-      await captureException(error, {
-        userId: request.auth?.uid,
-        extra: {
-          functionName: handler.name || 'callable',
-        },
-      });
-      await flush(2000);
-      throw error;
-    }
-  };
-}
-
-async function enforceRateLimit({ request, functionName }: EnforceRateLimitArgs) {
-  const uid = request.auth?.uid ?? 'anonymous';
-  const ipHeader =
-    (typeof request.rawRequest?.headers?.['x-forwarded-for'] === 'string'
-      ? request.rawRequest?.headers?.['x-forwarded-for']
-      : Array.isArray(request.rawRequest?.headers?.['x-forwarded-for'])
-      ? request.rawRequest?.headers?.['x-forwarded-for'][0]
-      : undefined) ?? request.rawRequest?.ip ?? 'unknown';
-
-  const ip = ipHeader.split(',')[0]?.trim() ?? 'unknown';
-  const key = `uid:${uid}|ip:${ip}|fn:${functionName}`;
-  const docId = key.replace(/[^A-Za-z0-9_-]/g, '_');
-  const rateRef = db.collection('rateLimits').doc(docId);
-  const now = Date.now();
-
+const assertRateLimit = async (uid: string, key: string, windowMs: number) => {
+  const rateRef = db.collection("rateLimits").doc(uid);
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(rateRef);
-    let count = 0;
-    let windowStartMs = now;
-
-    if (snap.exists) {
-      const data = snap.data() as Partial<RateLimitDoc> & { windowStart?: FirebaseFirestore.Timestamp };
-      if (data.windowStart) {
-        const candidate = data.windowStart.toMillis();
-        if (now - candidate < RATE_LIMIT_WINDOW_MS) {
-          windowStartMs = candidate;
-          count = typeof data.count === 'number' ? data.count : 0;
-        }
-      }
+    const now = Date.now();
+    const data = (snap.data() as Record<string, number> | undefined) ?? {};
+    const last = data[key] ?? 0;
+    if (now - last < windowMs) {
+      throw new functions.https.HttpsError("resource-exhausted", "Too many actions. Slow down.");
     }
-
-    if (now - windowStartMs >= RATE_LIMIT_WINDOW_MS) {
-      windowStartMs = now;
-      count = 0;
-    }
-
-    if (count + 1 > RATE_LIMIT_REQUESTS) {
-      throw new HttpsError('resource-exhausted', 'Too many requests. Please slow down.');
-    }
-
-    tx.set(
-      rateRef,
-      {
-        count: count + 1,
-        windowStart: admin.firestore.Timestamp.fromMillis(windowStartMs),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastUid: uid,
-        lastIp: ip,
-      },
-      { merge: true },
-    );
+    tx.set(rateRef, { [key]: now }, { merge: true });
   });
-}
+};
 
-function requireAuth(request: CallableRequest<unknown>): string {
-  const uid = request.auth?.uid;
-  if (!uid) {
-    throw new HttpsError('unauthenticated', 'Authentication is required.');
+const getHandle = async (uid: string) => {
+  const profileSnap = await db.collection("users").doc(uid).get();
+  if (!profileSnap.exists || !profileSnap.data()?.handle) {
+    throw new functions.https.HttpsError("failed-precondition", "Complete your handle before playing.");
   }
-  return uid;
-}
+  return profileSnap.data()!.handle as string;
+};
 
-function otherSlot(slot: PlayerSlot): PlayerSlot {
-  return slot === 'A' ? 'B' : 'A';
-}
+const randomCode = async () => {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (let i = 0; i < 5; i += 1) {
+    const code = Array.from({ length: 5 })
+      .map(() => alphabet[Math.floor(Math.random() * alphabet.length)]!)
+      .join("");
+    const doc = await db.collection("games").doc(code).get();
+    if (!doc.exists) return code;
+  }
+  throw new functions.https.HttpsError("internal", "Could not allocate game code");
+};
 
-function getPlayerSlot(game: GameState, uid: string): PlayerSlot | null {
-  if (game.players.A?.uid === uid) {
-    return 'A';
-  }
-  if (game.players.B?.uid === uid) {
-    return 'B';
-  }
+const getPlayerSlot = (game: GameDoc, uid: string): PlayerSlot | null => {
+  if (game.players.A?.uid === uid) return "A";
+  if (game.players.B?.uid === uid) return "B";
   return null;
-}
+};
 
-function ensureParticipant(game: GameState, uid: string): PlayerSlot {
-  const slot = getPlayerSlot(game, uid);
-  if (!slot) {
-    throw new HttpsError('permission-denied', 'You are not part of this game.');
-  }
-  return slot;
-}
+const opponentSlot = (slot: PlayerSlot): PlayerSlot => (slot === "A" ? "B" : "A");
 
-function assertPhase(game: GameState, phase: GameState['phase']) {
-  if (game.phase !== phase) {
-    throw new HttpsError('failed-precondition', `Game is not in the ${phase} phase.`);
-  }
-}
-
-function assertWinnerNotDeclared(game: GameState) {
-  if (game.winner) {
-    throw new HttpsError('failed-precondition', 'Game has already finished.');
-  }
-}
-
-function appendHistory(game: GameState, entry: Omit<HistoryEntry, 'ts'> & { ts?: FirebaseFirestore.Timestamp }) {
-  const ts = entry.ts ?? admin.firestore.Timestamp.now();
-  game.history = [...(game.history ?? []), { ...entry, ts }];
-}
-
-function overwriteLastHistory(game: GameState, entry: Partial<HistoryEntry> & { result: HistoryResult }) {
-  if (!game.history || game.history.length === 0) {
-    throw new HttpsError('internal', 'History is out of sync.');
-  }
-  const existing = game.history[game.history.length - 1];
-  game.history = [
-    ...game.history.slice(0, -1),
-    {
-      ...existing,
+const appendHistory = (tx: Transaction, ref: DocumentReference<GameDoc>, entry: Omit<GameHistoryEntry, 'ts'>) => {
+  tx.update(ref, {
+    history: admin.firestore.FieldValue.arrayUnion({
       ...entry,
-      result: entry.result,
-      ts: entry.ts ?? existing.ts ?? admin.firestore.Timestamp.now(),
-    },
-  ];
-}
-
-function addLetter(currentLetters: string): { letters: string; eliminated: boolean } {
-  const existing = currentLetters ?? '';
-  if (existing.length >= LETTER_SEQUENCE.length) {
-    return { letters: existing, eliminated: true };
-  }
-  const nextLetter = LETTER_SEQUENCE[existing.length];
-  const updated = `${existing}${nextLetter}`;
-  return { letters: updated, eliminated: updated.length >= LETTER_SEQUENCE.length };
-}
-
-async function runGameTransaction<T>(
-  gameId: string,
-  handler: GameTransaction<Promise<T> | T>,
-): Promise<T> {
-  const gameRef = db.collection('games').doc(gameId) as FirebaseFirestore.DocumentReference<GameState>;
-  return db.runTransaction(async (tx) => {
-    const snapshot = await tx.get(gameRef);
-    if (!snapshot.exists) {
-      throw new HttpsError('not-found', 'Game not found.');
-    }
-
-    const data = snapshot.data() as GameState;
-    const result = await handler(gameRef, data);
-    tx.update(gameRef, {
-      ...data,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return result;
+      ts: admin.firestore.FieldValue.serverTimestamp()
+    })
   });
-}
+};
 
-async function ensureUniqueCode(): Promise<{ code: string; gameRef: FirebaseFirestore.DocumentReference<GameState> }> {
-  const attempts = 10;
-  const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-  for (let i = 0; i < attempts; i += 1) {
-    const code = Array.from({ length: 6 }, () => alphabet.charAt(Math.floor(Math.random() * alphabet.length))).join('');
-    const existing = await db.collection('games').where('code', '==', code).limit(1).get();
-    if (existing.empty) {
-      const gameRef = db.collection('games').doc() as FirebaseFirestore.DocumentReference<GameState>;
-      return { code, gameRef };
-    }
-  }
-  throw new HttpsError('resource-exhausted', 'Unable to allocate game code. Please try again.');
-}
-
-const createGameHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'createGame' });
-  const uid = requireAuth(request);
-  const name = nameSchema.parse(request.data?.name);
-
-  const { code, gameRef } = await ensureUniqueCode();
-
-  await db.runTransaction(async (tx) => {
-    const now = admin.firestore.FieldValue.serverTimestamp();
-    tx.set(gameRef, {
-      code,
-      turn: 'A',
-      phase: 'SET_RECORD',
-      players: {
-        A: { uid, name, letters: '' },
-        B: { uid: '', name: '', letters: '' },
-      },
-      current: { by: 'A' },
-      history: [],
-      createdAt: now,
-      updatedAt: now,
-    } as unknown as GameState);
-  });
-
-  logger.info('Game created', { uid, gameId: gameRef.id, code });
-  return { gameId: gameRef.id, code };
-}));
-
-const joinGameHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'joinGame' });
-  const uid = requireAuth(request);
-  const name = nameSchema.parse(request.data?.name);
-  const code = codeSchema.parse(request.data?.code);
-
-  const snapshot = await db.collection('games').where('code', '==', code).limit(1).get();
-  if (snapshot.empty) {
-    throw new HttpsError('not-found', 'Game code not found.');
-  }
-
-  const doc = snapshot.docs[0];
-  const gameRef = doc.ref as FirebaseFirestore.DocumentReference<GameState>;
-
+const withGame = async (
+  code: string,
+  handler: (game: GameDoc, tx: Transaction, ref: DocumentReference<GameDoc>) => Promise<void>
+) => {
+  const gameRef = db.collection("games").doc(code) as DocumentReference<GameDoc>;
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(gameRef);
     if (!snap.exists) {
-      throw new HttpsError('not-found', 'Game not found.');
+      throw new functions.https.HttpsError("not-found", "Game not found");
     }
-    const data = snap.data() as GameState;
-    assertWinnerNotDeclared(data);
-
-    if (data.players.B?.uid && data.players.B.uid !== uid) {
-      throw new HttpsError('failed-precondition', 'Game already has two players.');
-    }
-    if (data.players.A?.uid === uid) {
-      logger.info('Player rejoining as slot A', { uid, gameId: gameRef.id });
-      data.players.A = { ...data.players.A, name };
-    } else {
-      data.players.B = { uid, name, letters: data.players.B?.letters ?? '' };
-    }
-    tx.update(gameRef, {
-      players: data.players,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    await handler(snap.data() as GameDoc, tx, gameRef);
   });
+};
 
-  logger.info('Player joined game', { uid, gameId: gameRef.id });
-  return { gameId: gameRef.id };
-}));
-
-const submitSetClipHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'submitSetClip' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-  const storagePath = storagePathSchema.parse(request.data?.storagePath);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    assertPhase(game, 'SET_RECORD');
-    const slot = ensureParticipant(game, uid);
-    if (slot !== game.current.by || slot !== game.turn) {
-      throw new HttpsError('failed-precondition', 'It is not your turn to set.');
-    }
-    if (game.current.setVideoPath) {
-      throw new HttpsError('failed-precondition', 'Set clip already submitted.');
-    }
-
-    const responder = otherSlot(slot);
-    game.current = {
-      by: slot,
-      responder,
-      setVideoPath: storagePath,
-    };
-    game.phase = 'SET_JUDGE';
-    return null;
-  });
-
-  logger.info('Set clip submitted', { uid, gameId });
-  return { ok: true };
-}));
-
-const judgeSetHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'judgeSet' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-  const approve = z.boolean().parse(request.data?.approve);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    assertPhase(game, 'SET_JUDGE');
-    const slot = ensureParticipant(game, uid);
-    const shooter = game.current.by;
-    const opponent = otherSlot(shooter);
-    if (slot !== opponent) {
-      throw new HttpsError('permission-denied', 'Only the opponent can judge the set.');
-    }
-    if (!game.current.setVideoPath) {
-      throw new HttpsError('failed-precondition', 'Set video missing.');
-    }
-
-    if (approve) {
-      appendHistory(game, {
-        by: shooter,
-        setPath: game.current.setVideoPath,
-        result: 'approved_set',
-      });
-      game.phase = 'RESP_RECORD';
-      game.current = {
-        ...game.current,
-        responder: opponent,
-      };
-    } else {
-      appendHistory(game, {
-        by: shooter,
-        setPath: game.current.setVideoPath,
-        result: 'declined_set',
-      });
-      game.phase = 'SET_RECORD';
-      game.current = { by: shooter };
-    }
-    return null;
-  });
-
-  logger.info('Set judged', { uid, gameId, approve });
-  return { ok: true };
-}));
-
-const submitRespClipHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'submitRespClip' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-  const storagePath = storagePathSchema.parse(request.data?.storagePath);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    assertPhase(game, 'RESP_RECORD');
-    const slot = ensureParticipant(game, uid);
-    const responder = game.current.responder;
-    if (!responder || slot !== responder) {
-      throw new HttpsError('failed-precondition', 'It is not your turn to respond.');
-    }
-    if (game.current.responseVideoPath) {
-      throw new HttpsError('failed-precondition', 'Response already submitted.');
-    }
-
-    game.current = {
-      ...game.current,
-      responseVideoPath: storagePath,
-    };
-    game.phase = 'RESP_JUDGE';
-    return null;
-  });
-
-  logger.info('Response submitted', { uid, gameId });
-  return { ok: true };
-}));
-
-const judgeRespHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'judgeResp' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-  const approve = z.boolean().parse(request.data?.approve);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    assertPhase(game, 'RESP_JUDGE');
-    const slot = ensureParticipant(game, uid);
-    const shooter = game.current.by;
-    if (slot !== shooter) {
-      throw new HttpsError('permission-denied', 'Only the shooter can judge the response.');
-    }
-
-    const responder = game.current.responder ?? otherSlot(shooter);
-    if (!game.history.length || game.history[game.history.length - 1].result !== 'approved_set') {
-      throw new HttpsError('failed-precondition', 'Set has not been approved.');
-    }
-
-    if (approve && !game.current.responseVideoPath) {
-      throw new HttpsError('failed-precondition', 'Response video missing.');
-    }
-
-    if (approve) {
-      overwriteLastHistory(game, {
-        result: 'landed',
-        respPath: game.current.responseVideoPath,
-        ts: admin.firestore.Timestamp.now(),
-      });
-    } else {
-      const defender = responder;
-      const currentLetters = game.players[defender]?.letters ?? '';
-      const { letters, eliminated } = addLetter(currentLetters);
-      game.players[defender] = {
-        ...game.players[defender],
-        letters,
-      };
-      overwriteLastHistory(game, {
-        result: 'failed',
-        respPath: game.current.responseVideoPath,
-        ts: admin.firestore.Timestamp.now(),
-      });
-      if (eliminated) {
-        game.winner = shooter;
+export const setHandle = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 10 })
+  .https.onCall(async (data: { handle?: string }, context) => {
+    try {
+      const uid = ensureAuth(context);
+      const handle = (data.handle ?? "").trim();
+      if (!/^[a-zA-Z0-9-]{3,20}$/.test(handle)) {
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "Handle must be 3-20 characters of letters, numbers, or hyphen."
+        );
       }
+      const lower = handle.toLowerCase();
+      const existing = await db.collection("users").where("handleLower", "==", lower).get();
+      if (!existing.empty && existing.docs[0]!.id !== uid) {
+        throw new functions.https.HttpsError("already-exists", "Handle already taken.");
+      }
+      await db.collection("users").doc(uid).set(
+        {
+          handle,
+          handleLower: lower,
+          createdAt: admin.firestore.FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+      return { handle };
+    } catch (error) {
+      Sentry.captureException(error);
+      throw error;
     }
-
-    const nextShooter = otherSlot(shooter);
-    game.turn = nextShooter;
-    game.phase = 'SET_RECORD';
-    game.current = { by: nextShooter };
-    return null;
   });
 
-  logger.info('Response judged', { uid, gameId, approve });
-  return { ok: true };
-}));
-
-const selfFailSetHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'selfFailSet' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    assertPhase(game, 'SET_RECORD');
-    const slot = ensureParticipant(game, uid);
-    if (slot !== game.current.by || slot !== game.turn) {
-      throw new HttpsError('failed-precondition', 'It is not your turn.');
+export const createGame = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 20 })
+  .https.onCall(async (_data, context) => {
+    try {
+      const uid = ensureAuth(context);
+      await assertRateLimit(uid, "create", 5000);
+      const handle = await getHandle(uid);
+      const code = await randomCode();
+      const gameRef = db.collection("games").doc(code);
+      const payload: GameDoc = {
+        code,
+        turn: "A",
+        phase: "SET_RECORD",
+        winner: null,
+        players: {
+          A: { uid, name: handle, letters: 0 },
+          B: { uid: "", name: "Awaiting rival", letters: 0 }
+        },
+        current: {
+          by: "A",
+          setVideoPath: null,
+          responseVideoPath: null
+        },
+        history: []
+      };
+      await gameRef.create(payload);
+      return { code };
+    } catch (error) {
+      Sentry.captureException(error);
+      if (error instanceof functions.https.HttpsError) throw error;
+      throw new functions.https.HttpsError("internal", "Unable to create game");
     }
+  });
 
-    appendHistory(game, {
-      by: slot,
-      result: 'failed',
+export const joinGame = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 20 })
+  .https.onCall(async (data: { code?: string }, context) => {
+    try {
+      const uid = ensureAuth(context);
+      await assertRateLimit(uid, "join", 3000);
+      const handle = await getHandle(uid);
+      const code = (data.code ?? "").trim().toUpperCase();
+      if (!code) {
+        throw new functions.https.HttpsError("invalid-argument", "Code required");
+      }
+      const gameRef = db.collection("games").doc(code);
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(gameRef);
+        if (!snap.exists) {
+          throw new functions.https.HttpsError("not-found", "Game not found");
+        }
+        const game = snap.data() as GameDoc;
+        const existingSlot = getPlayerSlot(game, uid);
+        if (existingSlot) {
+          return;
+        }
+        if (game.players.B.uid && game.players.B.uid !== uid) {
+          throw new functions.https.HttpsError("resource-exhausted", "Lobby full");
+        }
+        tx.update(gameRef, {
+          "players.B": { uid, name: handle, letters: game.players.B.letters ?? 0 }
+        });
+      });
+      return { gameId: code };
+    } catch (error) {
+      Sentry.captureException(error);
+      throw error;
+    }
+  });
+
+export const submitSetClip = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string; storagePath?: string }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId, storagePath } = data;
+    if (!gameId || !storagePath) {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
+    }
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot !== game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Not your set");
+      }
+      if (game.phase !== "SET_RECORD") {
+        throw new functions.https.HttpsError("failed-precondition", "Cannot submit set clip right now");
+      }
+      tx.update(ref, {
+        phase: "SET_JUDGE",
+        current: {
+          by: slot,
+          setVideoPath: storagePath,
+          responseVideoPath: null
+        }
+      });
     });
-
-    const nextShooter = otherSlot(slot);
-    game.turn = nextShooter;
-    game.phase = 'SET_RECORD';
-    game.current = { by: nextShooter };
-    return null;
+    return { ok: true };
   });
 
-  logger.info('Self fail set', { uid, gameId });
-  return { ok: true };
-}));
-
-const selfFailRespHandler = onCall(withSentry(async (request) => {
-  await enforceRateLimit({ request, functionName: 'selfFailResp' });
-  const uid = requireAuth(request);
-  const gameId = gameIdSchema.parse(request.data?.gameId);
-
-  await runGameTransaction(gameId, async (_gameRef, game) => {
-    assertWinnerNotDeclared(game);
-    if (game.phase !== 'RESP_RECORD' && game.phase !== 'RESP_JUDGE') {
-      throw new HttpsError('failed-precondition', 'No response in progress.');
+export const judgeSet = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string; approve?: boolean }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId, approve } = data;
+    if (!gameId || typeof approve !== "boolean") {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
     }
-    const slot = ensureParticipant(game, uid);
-    const shooter = game.current.by;
-    const responder = game.current.responder ?? otherSlot(shooter);
-    if (slot !== responder) {
-      throw new HttpsError('failed-precondition', 'Only the responder can self-fail.');
-    }
-    if (!game.history.length || game.history[game.history.length - 1].result !== 'approved_set') {
-      throw new HttpsError('failed-precondition', 'Set has not been approved.');
-    }
-
-    const currentLetters = game.players[slot]?.letters ?? '';
-    const { letters, eliminated } = addLetter(currentLetters);
-    game.players[slot] = {
-      ...game.players[slot],
-      letters,
-    };
-    overwriteLastHistory(game, {
-      result: 'failed',
-      respPath: game.current.responseVideoPath,
-      ts: admin.firestore.Timestamp.now(),
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot === game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Setter cannot judge set");
+      }
+      if (game.phase !== "SET_JUDGE") {
+        throw new functions.https.HttpsError("failed-precondition", "Wrong phase");
+      }
+      if (!game.current?.setVideoPath) {
+        throw new functions.https.HttpsError("failed-precondition", "No set clip found");
+      }
+      if (!approve) {
+        const nextTurn = opponentSlot(game.turn);
+        appendHistory(tx, ref, {
+          by: game.turn,
+          setPath: game.current.setVideoPath,
+          result: "declined_set"
+        });
+        tx.update(ref, {
+          phase: "SET_RECORD",
+          turn: nextTurn,
+          current: {
+            by: nextTurn,
+            setVideoPath: null,
+            responseVideoPath: null
+          }
+        });
+      } else {
+        tx.update(ref, {
+          phase: "RESP_RECORD"
+        });
+      }
     });
-
-    if (eliminated) {
-      game.winner = shooter;
-    }
-
-    const nextShooter = otherSlot(shooter);
-    game.turn = nextShooter;
-    game.phase = 'SET_RECORD';
-    game.current = { by: nextShooter };
-    return null;
+    return { ok: true };
   });
 
-  logger.info('Self fail response', { uid, gameId });
-  return { ok: true };
-}));
-export const createGame = createGameHandler;
-export const joinGame = joinGameHandler;
-export const submitSetClip = submitSetClipHandler;
-export const judgeSet = judgeSetHandler;
-export const submitRespClip = submitRespClipHandler;
-export const judgeResp = judgeRespHandler;
-export const selfFailSet = selfFailSetHandler;
-export const selfFailResp = selfFailRespHandler;
+export const submitRespClip = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string; storagePath?: string }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId, storagePath } = data;
+    if (!gameId || !storagePath) {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
+    }
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot === game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Setter cannot respond");
+      }
+      if (game.phase !== "RESP_RECORD") {
+        throw new functions.https.HttpsError("failed-precondition", "Wrong phase");
+      }
+      tx.update(ref, {
+        phase: "RESP_JUDGE",
+        current: {
+          ...game.current,
+          responseVideoPath: storagePath
+        }
+      });
+    });
+    return { ok: true };
+  });
+
+export const judgeResp = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string; approve?: boolean }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId, approve } = data;
+    if (!gameId || typeof approve !== "boolean") {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
+    }
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot !== game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Only setter judges response");
+      }
+      if (game.phase !== "RESP_JUDGE") {
+        throw new functions.https.HttpsError("failed-precondition", "Wrong phase");
+      }
+      const defenderSlot = opponentSlot(slot);
+      const defender = game.players[defenderSlot];
+      const historyEntryBase = {
+        by: slot,
+        setPath: game.current?.setVideoPath ?? null,
+        respPath: game.current?.responseVideoPath ?? null
+      };
+      if (approve) {
+        appendHistory(tx, ref, { ...historyEntryBase, result: "landed" });
+        tx.update(ref, {
+          phase: "SET_RECORD",
+          turn: defenderSlot,
+          current: {
+            by: defenderSlot,
+            setVideoPath: null,
+            responseVideoPath: null
+          }
+        });
+      } else {
+        const nextLetters = (defender?.letters ?? 0) + 1;
+        const updates: UpdateData<GameDoc> = {
+          phase: "SET_RECORD",
+          [`players.${defenderSlot}.letters`]: nextLetters,
+          current: {
+            by: slot,
+            setVideoPath: null,
+            responseVideoPath: null
+          }
+        };
+        if (nextLetters >= 3) {
+          (updates as UpdateData<GameDoc> & { winner?: string }).winner = game.players[slot].uid;
+        }
+        appendHistory(tx, ref, { ...historyEntryBase, result: "failed" });
+        tx.update(ref, updates);
+      }
+    });
+    return { ok: true };
+  });
+
+export const selfFailSet = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId } = data;
+    if (!gameId) {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
+    }
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot !== game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Not setter");
+      }
+      if (game.phase !== "SET_RECORD") {
+        throw new functions.https.HttpsError("failed-precondition", "Wrong phase");
+      }
+      const nextTurn = opponentSlot(slot);
+      appendHistory(tx, ref, {
+        by: slot,
+        setPath: game.current?.setVideoPath ?? null,
+        result: "declined_set"
+      });
+      tx.update(ref, {
+        phase: "SET_RECORD",
+        turn: nextTurn,
+        current: {
+          by: nextTurn,
+          setVideoPath: null,
+          responseVideoPath: null
+        }
+      });
+    });
+    return { ok: true };
+  });
+
+export const selfFailResp = functions
+  .region("us-central1")
+  .runWith({ maxInstances: 40 })
+  .https.onCall(async (data: { gameId?: string }, context) => {
+    const uid = ensureAuth(context);
+    const { gameId } = data;
+    if (!gameId) {
+      throw new functions.https.HttpsError("invalid-argument", "Missing params");
+    }
+    await withGame(gameId, async (game, tx, ref) => {
+      const slot = getPlayerSlot(game, uid);
+      if (!slot) throw new functions.https.HttpsError("permission-denied", "Not part of this game");
+      if (slot === game.turn) {
+        throw new functions.https.HttpsError("failed-precondition", "Setter cannot self-fail response");
+      }
+      if (game.phase !== "RESP_RECORD") {
+        throw new functions.https.HttpsError("failed-precondition", "Wrong phase");
+      }
+      const nextLetters = (game.players[slot]?.letters ?? 0) + 1;
+      const updates: UpdateData<GameDoc> = {
+        phase: "SET_RECORD",
+        [`players.${slot}.letters`]: nextLetters,
+        current: {
+          by: game.turn,
+          setVideoPath: null,
+          responseVideoPath: null
+        }
+      };
+      if (nextLetters >= 3) {
+        (updates as UpdateData<GameDoc> & { winner?: string }).winner = game.players[game.turn].uid;
+      }
+      appendHistory(tx, ref, {
+        by: game.turn,
+        setPath: game.current?.setVideoPath ?? null,
+        result: "failed"
+      });
+      tx.update(ref, updates);
+    });
+    return { ok: true };
+  });

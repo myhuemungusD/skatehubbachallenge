@@ -5,206 +5,24 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function authUid() {
-      return isAuthenticated() ? request.auth.uid : null;
+    function isGamePlayer(game) {
+      return (
+        request.auth != null &&
+        (game.data.players.A.uid == request.auth.uid || game.data.players.B.uid == request.auth.uid)
+      );
     }
 
-    function slotFor(game) {
-      return game.players.A.uid == authUid()
-        ? 'A'
-        : game.players.B.uid == authUid()
-        ? 'B'
-        : '';
-    }
-
-    function isPlayer(game) {
-      return authUid() != null && slotFor(game) != '';
-    }
-
-    function otherSlot(slot) {
-      return slot == 'A' ? 'B' : 'A';
-    }
-
-    function baseInvariant(before, after) {
-      return after.code == before.code && after.createdAt == before.createdAt;
-    }
-
-    function playersUnchanged(before, after) {
-      return after.players.A == before.players.A && after.players.B == before.players.B;
-    }
-
-    function playersLettersSame(before, after) {
-      return after.players.A.letters == before.players.A.letters && after.players.B.letters == before.players.B.letters;
-    }
-
-    function historyEqual(before, after) {
-      return after.history == before.history;
-    }
-
-    function appendedHistory(before, after, result, setPath) {
-      return after.history.size() == before.history.size() + 1 &&
-        after.history[before.history.size()].result == result &&
-        after.history[before.history.size()].by == before.current.by &&
-        after.history[before.history.size()].setPath == setPath;
-    }
-
-    function updatedHistoryResult(before, after, result) {
-      return after.history.size() == before.history.size() &&
-        before.history.size() > 0 &&
-        after.history[after.history.size() - 1].by == before.history[before.history.size() - 1].by &&
-        after.history[after.history.size() - 1].setPath == before.history[before.history.size() - 1].setPath &&
-        after.history[after.history.size() - 1].result == result;
-    }
-
-    function addsNextLetter(beforeLetters, afterLetters) {
-      return (beforeLetters == '' && afterLetters == 'S') ||
-        (beforeLetters == 'S' && afterLetters == 'SK') ||
-        (beforeLetters == 'SK' && afterLetters == 'SK8');
-    }
-
-    function winnerPreserved(before, after) {
-      return before.winner == after.winner || after.winner == null;
+    match /users/{userId} {
+      allow read, write: if isAuthenticated() && request.auth.uid == userId;
     }
 
     match /games/{gameId} {
-      allow read: if isPlayer(resource.data);
+      allow read: if isGamePlayer(resource);
+      allow write: if false;
+    }
 
-      allow create: if isAuthenticated() &&
-        request.resource.data.players.A.uid == authUid() &&
-        request.resource.data.players.B.uid == '' &&
-        request.resource.data.turn == 'A' &&
-        request.resource.data.phase == 'SET_RECORD';
-
-      allow update: if isPlayer(resource.data) && validGameTransition(resource.data, request.resource.data);
-
-      allow delete: if false;
-
-      function validGameTransition(before, after) {
-        return baseInvariant(before, after) &&
-          (setSubmission(before, after) ||
-            setDeclined(before, after) ||
-            setApproved(before, after) ||
-            responseSubmission(before, after) ||
-            responseJudgedLanded(before, after) ||
-            responseJudgedFailed(before, after) ||
-            selfFailSet(before, after) ||
-            selfFailResp(before, after));
-      }
-
-      function setSubmission(before, after) {
-        return before.phase == 'SET_RECORD' &&
-          after.phase == 'SET_JUDGE' &&
-          slotFor(before) == before.current.by &&
-          after.current.by == before.current.by &&
-          after.current.responder == otherSlot(before.current.by) &&
-          after.current.keys().hasAll(['by', 'responder', 'setVideoPath']) &&
-          !after.current.keys().hasAny(['responseVideoPath']) &&
-          after.current.setVideoPath is string &&
-          after.current.setVideoPath.size() > 0 &&
-          after.turn == before.turn &&
-          playersUnchanged(before, after) &&
-          historyEqual(before, after) &&
-          winnerPreserved(before, after);
-      }
-
-      function setApproved(before, after) {
-        return before.phase == 'SET_JUDGE' &&
-          after.phase == 'RESP_RECORD' &&
-          slotFor(before) == otherSlot(before.current.by) &&
-          after.current.by == before.current.by &&
-          after.current.responder == otherSlot(before.current.by) &&
-          after.current.setVideoPath == before.current.setVideoPath &&
-          !after.current.keys().hasAny(['responseVideoPath']) &&
-          appendedHistory(before, after, 'approved_set', before.current.setVideoPath) &&
-          playersUnchanged(before, after) &&
-          after.turn == before.turn &&
-          winnerPreserved(before, after);
-      }
-
-      function setDeclined(before, after) {
-        return before.phase == 'SET_JUDGE' &&
-          after.phase == 'SET_RECORD' &&
-          slotFor(before) == otherSlot(before.current.by) &&
-          after.current.by == before.current.by &&
-          !after.current.keys().hasAny(['responder', 'setVideoPath', 'responseVideoPath']) &&
-          appendedHistory(before, after, 'declined_set', before.current.setVideoPath) &&
-          playersUnchanged(before, after) &&
-          after.turn == before.turn &&
-          winnerPreserved(before, after);
-      }
-
-      function responseSubmission(before, after) {
-        return before.phase == 'RESP_RECORD' &&
-          after.phase == 'RESP_JUDGE' &&
-          slotFor(before) == before.current.responder &&
-          after.current.by == before.current.by &&
-          after.current.responder == before.current.responder &&
-          after.current.setVideoPath == before.current.setVideoPath &&
-          after.current.responseVideoPath is string &&
-          after.current.responseVideoPath.size() > 0 &&
-          playersUnchanged(before, after) &&
-          historyEqual(before, after) &&
-          after.turn == before.turn &&
-          winnerPreserved(before, after);
-      }
-
-      function responseJudgedLanded(before, after) {
-        return before.phase == 'RESP_JUDGE' &&
-          after.phase == 'SET_RECORD' &&
-          slotFor(before) == before.current.by &&
-          after.turn == otherSlot(before.current.by) &&
-          after.current.by == otherSlot(before.current.by) &&
-          after.current.keys().hasOnly(['by']) &&
-          updatedHistoryResult(before, after, 'landed') &&
-          playersUnchanged(before, after) &&
-          winnerPreserved(before, after);
-      }
-
-      function responseJudgedFailed(before, after) {
-        return before.phase == 'RESP_JUDGE' &&
-          after.phase == 'SET_RECORD' &&
-          slotFor(before) == before.current.by &&
-          after.turn == otherSlot(before.current.by) &&
-          after.current.by == otherSlot(before.current.by) &&
-          after.current.keys().hasOnly(['by']) &&
-          updatedHistoryResult(before, after, 'failed') &&
-          lettersAdvanced(before, after, otherSlot(before.current.by)) &&
-          winnerValid(before, after, otherSlot(before.current.by));
-      }
-
-      function selfFailSet(before, after) {
-        return before.phase == 'SET_RECORD' &&
-          after.phase == 'SET_RECORD' &&
-          slotFor(before) == before.current.by &&
-          after.turn == otherSlot(before.current.by) &&
-          after.current.by == otherSlot(before.current.by) &&
-          after.current.keys().hasOnly(['by']) &&
-          appendedHistory(before, after, 'failed', null) &&
-          playersUnchanged(before, after) &&
-          winnerPreserved(before, after);
-      }
-
-      function selfFailResp(before, after) {
-        return (before.phase == 'RESP_RECORD' || before.phase == 'RESP_JUDGE') &&
-          after.phase == 'SET_RECORD' &&
-          slotFor(before) == before.current.responder &&
-          after.turn == otherSlot(before.current.by) &&
-          after.current.by == otherSlot(before.current.by) &&
-          after.current.keys().hasOnly(['by']) &&
-          updatedHistoryResult(before, after, 'failed') &&
-          lettersAdvanced(before, after, before.current.responder) &&
-          winnerValid(before, after, before.current.responder);
-      }
-
-      function lettersAdvanced(before, after, slot) {
-        return addsNextLetter(before.players[slot].letters, after.players[slot].letters) &&
-          (slot == 'A' ? after.players.B == before.players.B : after.players.A == before.players.A);
-      }
-
-      function winnerValid(before, after, slot) {
-        return (after.players[slot].letters == 'SK8' && after.winner == otherSlot(slot)) ||
-          (after.players[slot].letters != 'SK8' && winnerPreserved(before, after));
-      }
+    match /rateLimits/{userId} {
+      allow read, write: if false;
     }
   }
 }

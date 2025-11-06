@@ -2,27 +2,26 @@
   "name": "skatehubba-functions",
   "version": "1.0.0",
   "private": true,
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "deploy": "npm run build && firebase deploy --only functions",
+    "lint": "eslint --ext .ts src"
+  },
   "engines": {
     "node": "18"
   },
-  "main": "lib/index.js",
-  "scripts": {
-    "build": "tsc --project tsconfig.json",
-    "lint": "eslint --ext .ts src",
-    "deploy": "npm run build && firebase deploy --only functions",
-    "dev": "npm run build -- --watch"
-  },
   "dependencies": {
-    "firebase-admin": "^11.10.1",
-    "firebase-functions": "^4.9.0",
-    "zod": "^3.23.8"
+    "@sentry/node": "^7.104.0",
+    "firebase-admin": "^11.11.0",
+    "firebase-functions": "^4.6.0"
   },
   "devDependencies": {
-    "@types/node": "^20.11.25",
+    "@types/node": "20.11.19",
     "@typescript-eslint/eslint-plugin": "^7.0.2",
     "@typescript-eslint/parser": "^7.0.2",
-    "eslint": "^8.57.0",
+    "eslint": "8.56.0",
     "eslint-config-prettier": "^9.1.0",
-    "typescript": "^5.4.2"
+    "typescript": "5.3.3"
   }
 }

@@ -1,0 +1,51 @@
+{
+  "name": "skatehubbaweb",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:e2e": "playwright test",
+    "prepare": "husky install",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,md}\""
+  },
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.0.2",
+    "@sentry/nextjs": "^7.104.0",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.0",
+    "firebase": "^10.9.0",
+    "next": "14.1.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "tailwind-merge": "^2.2.1",
+    "zustand": "^4.4.0"
+  },
+  "devDependencies": {
+    "@lhci/cli": "0.12.0",
+    "@playwright/test": "^1.41.2",
+    "@types/node": "20.11.19",
+    "@types/react": "18.2.40",
+    "@types/react-dom": "18.2.14",
+    "autoprefixer": "10.4.16",
+    "eslint": "8.56.0",
+    "eslint-config-next": "14.1.0",
+    "husky": "8.0.3",
+    "lint-staged": "15.2.0",
+    "lighthouse": "11.7.1",
+    "playwright": "^1.41.2",
+    "postcss": "8.4.33",
+    "prettier": "3.1.1",
+    "tailwindcss": "3.4.1",
+    "typescript": "5.3.3",
+    "vitest": "1.2.2"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": "next lint --fix --file",
+    "*.{ts,tsx,js,jsx,json,css,md}": "prettier --write"
+  }
+}

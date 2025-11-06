@@ -1,0 +1,14 @@
+node_modules
+.next
+out
+.env.local
+.env
+firebase-debug.log
+functions/node_modules
+functions/lib
+functions/package-lock.json
+package-lock.json
+coverage
+playwright-report
+.lhci
+.DS_Store
